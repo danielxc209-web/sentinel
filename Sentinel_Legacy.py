@@ -43,6 +43,7 @@ SAFE_PIP_ALLOWLIST = {
     "lxml",
     "python-docx",
     "openpyxl",
+    "cv2"
 }
 
 # Block dangerous patterns in generated code
