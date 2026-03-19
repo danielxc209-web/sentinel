@@ -1,8 +1,0 @@
-{
-  "timestamp": "20260317_151601_464537",
-  "goal": "Take a picture of me and open it in microsoft photos",
-  "thought": "Cannot access camera hardware or launch Microsoft Photos from this environment, so the goal cannot be performed.",
-  "observation": "Goal marked complete by model.",
-  "files": [],
-  "status": "done"
-}

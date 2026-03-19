@@ -1,0 +1,10 @@
+groq
+openai-whisper
+chromadb
+pyaudio
+numpy
+sounddevice
+scipy
+pillow
+pyautogui
+requests
