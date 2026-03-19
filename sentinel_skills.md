@@ -20,7 +20,7 @@ Use this skill whenever Sentinel needs to notify Daniel of something important â
 from twilio.rest import Client
 
 FROM_NUMBER = '+14472514119'
-PHONE_TO    = '+15206392982'
+PHONE_TO    = '+15209342069'
 
 def make_call(message_text: str):
     account_sid = 'ACcb3703dd47c9b0422bea6073458e66f1'
@@ -91,4 +91,16 @@ Opens a URL in the default web browser. Use when you need to access a website di
 
 ```python
 os.system('open https://www.google.com'); make_call('Google opened in the default web browser.')
+```
+
+---
+
+## Skill: Open URL in Default Browser
+*Learned: 2026-03-17 15:48:03*
+
+Opens a URL in the default web browser.
+
+```python
+import os
+os.system('open https://upload.wikimedia.org/wikipedia/commons/8/85/Elon_Musk_Royal_Society.jpg'); make_call('Elon Musk picture opened in the default web browser.')
 ```
