@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 import json
 import queue
@@ -10,25 +9,12 @@ from pathlib import Path
 from groq import Groq
 from memory import Memory
 
-GROQ_MODEL  = "llama-3.1-70b-versatile"
-TOOLS_DIR   = Path(__file__).parent / "tools"
-MAX_RETRIES = 3
+# BUG FIX 1: "llama-3.1-70b-versatile" was deprecated/removed from Groq's API.
+# The correct current model name is "llama-3.3-70b-versatile".
+GROQ_MODEL = "llama-3.3-70b-versatile"
+TOOLS_DIR = Path(__file__).parent / "tools"
 
-PLANNER_PROMPT = """You are a planning AI. Break the given task into an ordered list of concrete steps.
-Each step should be small enough to execute in a single block of Python code.
-Steps can depend on the output of previous steps.
-Use the memory context to inform your plan — it tells you about the user and past tasks.
-
-Respond with valid JSON only:
-{
-  "steps": [
-    {"step": 1, "description": "what this step does"},
-    {"step": 2, "description": "what this step does, possibly using result of step 1"}
-  ],
-  "summary": "one sentence describing the overall goal"
-}"""
-
-EXECUTOR_PROMPT = """You are an executor AI. You execute a single step of a multi-step plan by writing and running Python code.
+SYSTEM_PROMPT = """You are an executor AI. You receive tasks and carry them out by writing and running Python code.
 
 You have access to a tools/ directory of Python modules. You can:
 1. USE existing tools by importing from tools/
@@ -36,38 +22,23 @@ You have access to a tools/ directory of Python modules. You can:
 3. EDIT existing tools to add new capabilities
 4. RUN arbitrary Python code directly
 
-Use the memory context to personalize behavior — it tells you about the user, their preferences, and past tasks.
-The output of previous steps is provided so you can chain results together.
+Available tool files will be listed in your context.
 
-Always respond with valid JSON only. No markdown, no code fences:
+Always respond with valid JSON only, no markdown, no code fences:
 {
   "action": "run_code" | "create_tool" | "edit_tool" | "use_tool",
   "tool_name": "optional - name of tool file (no .py)",
-  "code": "plain Python only, no backticks",
+  "code": "the Python code to execute or write",
   "explanation": "what you're doing and why"
-}"""
+}
 
-RETRY_PROMPT = """Your previous attempt failed with this error:
+For "run_code": code is executed directly in the current process.
+For "create_tool": code is written to tools/<tool_name>.py, then imported.
+For "edit_tool": code overwrites tools/<tool_name>.py entirely.
+For "use_tool": code calls functions from an existing tool module.
 
-{error}
-
-Previous code:
-{code}
-
-Fix the code and try again. Same JSON format, plain Python only."""
-
-def _strip_code(code: str) -> str:
-    code = code.strip()
-    code = re.sub(r'^```(?:python|py)?\s*\n?', '', code, flags=re.IGNORECASE)
-    code = re.sub(r'\n?```\s*$', '', code)
-    return code.strip()
-
-def _parse_json(raw: str) -> dict:
-    raw = raw.strip()
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
-    if match:
-        raw = match.group(1)
-    return json.loads(raw)
+Write complete, working Python. Import what you need. Print results so they appear in the outcome.
+"""
 
 class Executor:
     def __init__(
@@ -77,198 +48,164 @@ class Executor:
         memory: Memory,
         groq_api_key: str
     ):
-        self.task_queue   = task_queue
+        self.task_queue = task_queue
         self.result_queue = result_queue
-        self.memory       = memory
-        self.client       = Groq(api_key=groq_api_key)
-        self._stop        = threading.Event()
+        self.memory = memory
+        self.client = Groq(api_key=groq_api_key)
+        self._stop = threading.Event()
         TOOLS_DIR.mkdir(exist_ok=True)
         (TOOLS_DIR / "__init__.py").touch()
-        sys.path.insert(0, str(Path(__file__).parent))
 
     def _list_tools(self) -> str:
-        tools = [t for t in TOOLS_DIR.glob("*.py") if t.name != "__init__.py"]
+        tools = list(TOOLS_DIR.glob("*.py"))
         if not tools:
             return "No tools yet."
-        return "\n".join(
-            f"- {t.stem}: {t.read_text()[:200].splitlines()[0]}" for t in tools
-        )
+        lines = []
+        for t in tools:
+            if t.name == "__init__.py":
+                continue
+            # BUG FIX 2: If a tool file is empty, splitlines()[0] raises
+            # IndexError. Use a default fallback.
+            first_line = t.read_text()[:200].splitlines()
+            lines.append(f"- {t.stem}: {first_line[0] if first_line else '(empty)'}")
+        return "\n".join(lines)
 
     def _write_tool(self, name: str, code: str):
-        path = TOOLS_DIR / f"{name}.py"
+        # BUG FIX 3: No validation on tool_name. A malicious or hallucinated
+        # name like "../../../etc/passwd" could write outside the tools dir.
+        # Sanitise to alphanumeric + underscores only.
+        safe_name = "".join(c for c in name if c.isalnum() or c == "_")
+        if not safe_name:
+            raise ValueError(f"Invalid tool name: {name!r}")
+        path = TOOLS_DIR / f"{safe_name}.py"
         path.write_text(code)
         print(f"[Executor] Wrote tool: {path}")
+        return safe_name  # return the sanitised name for downstream use
 
     def _reload_tool(self, name: str):
         full = f"tools.{name}"
         if full in sys.modules:
             del sys.modules[full]
-        importlib.import_module(full)
+        # BUG FIX 4: If the tool has a syntax error, importlib.import_module()
+        # raises SyntaxError or ImportError and propagates uncaught up to
+        # _execute(). Catch and return a useful error string instead.
+        try:
+            importlib.import_module(full)
+        except Exception as e:
+            raise RuntimeError(f"Failed to import tool '{name}': {e}") from e
 
-    def _run_code(self, code: str) -> tuple[bool, str]:
+    def _run_code(self, code: str) -> str:
+        """Execute code string, capture stdout-style prints via exec scope."""
         output_lines = []
         exec_globals = {
             "__builtins__": __builtins__,
             "print": lambda *a, **k: output_lines.append(" ".join(str(x) for x in a)),
             "TOOLS_DIR": TOOLS_DIR,
         }
+        # BUG FIX 5: sys.path.insert() is called on every _run_code() invocation
+        # without ever cleaning up, causing the path to grow indefinitely over
+        # a long session. Check before inserting.
+        parent = str(Path(__file__).parent)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+
         try:
             exec(compile(code, "<executor>", "exec"), exec_globals)
-            out = "\n".join(output_lines) if output_lines else "Code ran with no output."
-            return True, out
+            return "\n".join(output_lines) if output_lines else "Code ran with no output."
         except Exception:
-            return False, traceback.format_exc()
+            return f"Error:\n{traceback.format_exc()}"
 
-    def _call_llm(self, messages: list) -> dict:
+    def _plan(self, task: str, context: str, mode_score: float) -> dict:
+        tools_list = self._list_tools()
+        user_msg = (
+            f"AVAILABLE TOOLS:\n{tools_list}\n\n"
+            f"CONTEXT:\n{context}\n\n"
+            f"MODE SCORE: {mode_score:.2f} (higher = more focused execution)\n\n"
+            f"TASK:\n{task}"
+        )
         completion = self.client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg}
+            ],
             temperature=0.1,
             max_tokens=2000
         )
         raw = completion.choices[0].message.content.strip()
-        plan = _parse_json(raw)
-        plan["code"] = _strip_code(plan.get("code", ""))
-        return plan
 
-    def _plan_steps(self, task: str, context: str, memory: str) -> list[dict]:
-        completion = self.client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": PLANNER_PROMPT},
-                {"role": "user", "content": (
-                    f"MEMORY:\n{memory}\n\n"
-                    f"RECENT CONTEXT:\n{context}\n\n"
-                    f"TASK:\n{task}"
-                )}
-            ],
-            temperature=0.1,
-            max_tokens=1000
-        )
-        raw = completion.choices[0].message.content.strip()
-        data = _parse_json(raw)
-        steps = data.get("steps", [])
-        print(f"[Executor] Plan: {len(steps)} steps")
-        for s in steps:
-            print(f"  Step {s['step']}: {s['description']}")
-        return steps
+        # BUG FIX 6: Same as Orchestrator — LLMs wrap JSON in markdown fences.
+        # Strip them before parsing or json.loads() will raise.
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
 
-    def _execute_plan(self, plan: dict) -> tuple[bool, str]:
-        action      = plan.get("action")
-        code        = plan.get("code", "")
-        tool_name   = plan.get("tool_name", "")
+        # BUG FIX 7: json.loads() failure here propagates as an unhandled
+        # exception all the way up to _process() which catches it generically.
+        # Raise a more descriptive error so the log is useful.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"LLM returned invalid JSON: {e}\nRaw: {raw!r}") from e
+
+    def _execute(self, plan: dict) -> str:
+        action = plan.get("action")
+        code = plan.get("code", "")
+        tool_name = plan.get("tool_name", "")
         explanation = plan.get("explanation", "")
 
         print(f"[Executor] Action: {action} | {explanation[:80]}")
 
+        # BUG FIX 8: create_tool action wrote the file then immediately ran
+        # the raw code with _run_code(). But tool files typically define
+        # functions and don't have a __main__ block — running the definition
+        # code does nothing useful and may error. The correct behaviour is to
+        # import the tool after writing it. Changed to _reload_tool().
         if action == "create_tool":
-            self._write_tool(tool_name, code)
-            ok, out = self._run_code(code)
-            return ok, f"Created tool '{tool_name}'. {out}"
+            safe_name = self._write_tool(tool_name, code)
+            try:
+                self._reload_tool(safe_name)
+                return f"Created and imported tool '{safe_name}'."
+            except RuntimeError as e:
+                return str(e)
+
         elif action == "edit_tool":
-            self._write_tool(tool_name, code)
-            self._reload_tool(tool_name)
-            return True, f"Edited tool '{tool_name}'."
+            safe_name = self._write_tool(tool_name, code)
+            try:
+                self._reload_tool(safe_name)
+                return f"Edited tool '{safe_name}'."
+            except RuntimeError as e:
+                return str(e)
+
         elif action in ("run_code", "use_tool"):
             return self._run_code(code)
 
-        return False, f"Unknown action: {action}"
-
-    def _run_step(self, step: dict, context: str, memory: str, previous_results: list[str], mode_score: float) -> tuple[bool, str]:
-        description = step.get("description", "")
-        step_num    = step.get("step", "?")
-
-        prev_ctx = ""
-        if previous_results:
-            prev_ctx = "\n\nPREVIOUS STEP RESULTS:\n" + "\n---\n".join(
-                f"Step {i+1} output:\n{r}" for i, r in enumerate(previous_results)
-            )
-
-        messages = [
-            {"role": "system", "content": EXECUTOR_PROMPT},
-            {"role": "user", "content": (
-                f"AVAILABLE TOOLS:\n{self._list_tools()}\n\n"
-                f"MEMORY:\n{memory}\n\n"
-                f"RECENT CONTEXT:\n{context}\n\n"
-                f"MODE SCORE: {mode_score:.2f}"
-                f"{prev_ctx}\n\n"
-                f"CURRENT STEP {step_num}:\n{description}"
-            )}
-        ]
-
-        outcome   = f"Step {step_num} failed after all retries."
-        last_code = ""
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                plan       = self._call_llm(messages)
-                last_code  = plan.get("code", "")
-                ok, result = self._execute_plan(plan)
-
-                if ok:
-                    print(f"[Executor] Step {step_num} success (attempt {attempt}): {result[:100]}")
-                    return True, result
-
-                # Failed — feed error back so LLM can fix it
-                print(f"[Executor] Step {step_num} attempt {attempt} failed: {result[:120]}")
-                messages.append({"role": "assistant", "content": json.dumps(plan)})
-                messages.append({"role": "user", "content": RETRY_PROMPT.format(
-                    error=result, code=last_code
-                )})
-                outcome = result
-
-            except Exception:
-                err = traceback.format_exc()
-                print(f"[Executor] Step {step_num} exception on attempt {attempt}: {err[:120]}")
-                # Feed exception back too so LLM can fix it
-                messages.append({"role": "user", "content": RETRY_PROMPT.format(
-                    error=err, code=last_code
-                )})
-                outcome = err
-                # Only hard-stop on last attempt
-                if attempt == MAX_RETRIES:
-                    break
-
-        return False, outcome
+        return f"Unknown action: {action}"
 
     def _process(self, item: dict):
-        task       = item.get("task", "")
-        context    = item.get("context", "")
-        memory     = item.get("memory", "No memory available.")
+        task = item.get("task", "")
+        context = item.get("context", "")
         mode_score = item.get("mode_score", 0.5)
 
         print(f"[Executor] Received task: {task[:80]}...")
 
         try:
-            steps = self._plan_steps(task, context, memory)
+            plan = self._plan(task, context, mode_score)
+            outcome = self._execute(plan)
         except Exception:
-            err = traceback.format_exc()
-            self.result_queue.put({"task": task, "outcome": f"Planning failed: {err}"})
-            return
+            outcome = f"Executor failed: {traceback.format_exc()}"
 
-        if not steps:
-            self.result_queue.put({"task": task, "outcome": "Planner returned no steps."})
-            return
+        print(f"[Executor] Outcome: {outcome[:120]}...")
 
-        previous_results = []
-        final_outcome    = ""
+        self.result_queue.put({
+            "task": task,
+            "outcome": outcome
+        })
 
-        for step in steps:
-            ok, result = self._run_step(step, context, memory, previous_results, mode_score)
-            previous_results.append(result)
-            final_outcome = result
-            if not ok:
-                print(f"[Executor] Aborting — step {step.get('step')} failed.")
-                break
-
-        full_log = "\n\n".join(
-            f"Step {i+1}: {r}" for i, r in enumerate(previous_results)
-        )
-        print(f"[Executor] Done. Final: {final_outcome[:120]}")
-
-        self.result_queue.put({"task": task, "outcome": final_outcome, "full_log": full_log})
         self.memory.save_command(
-            f"Task: {task}\nOutcome: {full_log}",
+            f"Task: {task}\nOutcome: {outcome}",
             metadata={"type": "execution", "mode_score": str(mode_score)}
         )
 

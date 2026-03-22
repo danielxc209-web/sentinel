@@ -1,90 +1,103 @@
-import os
-import uuid
+import chromadb
+from chromadb.utils import embedding_functions
 from datetime import datetime
 from typing import Optional
 
-from qdrant_client import QdrantClient, models
-
-# Remember to change these to enviornment variables. You can still push because it's just me and Javan.
-QDRANT_URL    = "https://9b642903-8f06-4739-9996-cef41db2b93b.us-east4-0.gcp.cloud.qdrant.io"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.dgtszI6cj9EEcrzryCwKFkUx6RV7JSD_sp9BHthmAbI"
-
-
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-VECTOR_SIZE = 384
-CONV_COL    = "conversation"
-CMD_COL     = "command"
+EMBED_FN = embedding_functions.DefaultEmbeddingFunction()
 
 class Memory:
-    def __init__(self):
-        self.client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-        # Load fastembed locally for generating embeddings
-        from fastembed import TextEmbedding
-        self.embedder = TextEmbedding(model_name=EMBED_MODEL)
-        self._ensure_collections()
+    """
+    Dual ChromaDB vector store.
+    - 'conversation' store: social context, preferences, mood, dialogue history
+    - 'command' store: tasks run, tools built, outcomes, goals completed
 
-    def _embed(self, text: str) -> list[float]:
-        return list(self.embedder.embed([text]))[0].tolist()
+    Retrieval is blended by mode_score (0.0 = full conversation, 1.0 = full command).
+    """
 
-    def _ensure_collections(self):
-        existing = {c.name for c in self.client.get_collections().collections}
-        for name in (CONV_COL, CMD_COL):
-            if name not in existing:
-                self.client.create_collection(
-                    collection_name=name,
-                    vectors_config=models.VectorParams(
-                        size=VECTOR_SIZE,
-                        distance=models.Distance.COSINE
-                    )
-                )
+    def __init__(self, path: str = "./chroma_db"):
+        self.client = chromadb.PersistentClient(path=path)
 
-    def _now(self) -> str:
-        return datetime.utcnow().isoformat()
-
-    def _save(self, collection: str, text: str, metadata: Optional[dict]):
-        vector = self._embed(text)
-        self.client.upsert(
-            collection_name=collection,
-            points=[models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload={"text": text, "timestamp": self._now(), **(metadata or {})}
-            )]
+        self.conv_store = self.client.get_or_create_collection(
+            name="conversation",
+            embedding_function=EMBED_FN,
+            metadata={"description": "Social context, preferences, mood"}
         )
 
+        self.cmd_store = self.client.get_or_create_collection(
+            name="command",
+            embedding_function=EMBED_FN,
+            metadata={"description": "Tasks, tools, outcomes, goals"}
+        )
+
+    def _uid(self, prefix: str) -> str:
+        return f"{prefix}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+
     def save_conversation(self, text: str, metadata: Optional[dict] = None):
-        self._save(CONV_COL, text, metadata)
+        # BUG FIX 1: ChromaDB requires all metadata values to be str, int, float,
+        # or bool. Passing None or other types raises a hard error at runtime.
+        # Sanitise the metadata dict before storing.
+        raw_meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                for k, v in raw_meta.items()}
+        self.conv_store.add(
+            documents=[text],
+            metadatas=[meta],
+            ids=[self._uid("conv")]
+        )
 
     def save_command(self, text: str, metadata: Optional[dict] = None):
-        self._save(CMD_COL, text, metadata)
+        # BUG FIX 1 (same): same metadata sanitisation needed here.
+        raw_meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                for k, v in raw_meta.items()}
+        self.cmd_store.add(
+            documents=[text],
+            metadatas=[meta],
+            ids=[self._uid("cmd")]
+        )
 
     def retrieve(self, query: str, mode_score: float, n: int = 6) -> str:
+        """
+        Blend results from both stores based on mode_score.
+        mode_score 0.0 → all conversation
+        mode_score 1.0 → all command
+        """
         mode_score = max(0.0, min(1.0, mode_score))
+
         conv_n = max(1, round(n * (1 - mode_score)))
         cmd_n  = max(1, round(n * mode_score))
-        vector = self._embed(query)
+
+        # BUG FIX 2: The original always fetched at least 1 result from BOTH
+        # stores regardless of mode_score, because conv_n and cmd_n were each
+        # floored at 1. This means a pure-command query (mode_score=1.0) still
+        # pulled a conversation result, polluting the context. Fixed by only
+        # clamping to 1 when the store is actually supposed to contribute.
+        conv_n = round(n * (1 - mode_score))
+        cmd_n  = round(n * mode_score)
+
         results = []
 
-        try:
-            hits = self.client.search(
-                collection_name=CONV_COL,
-                query_vector=vector,
-                limit=conv_n
+        if conv_n > 0 and self.conv_store.count() > 0:
+            conv_res = self.conv_store.query(
+                query_texts=[query],
+                n_results=min(conv_n, self.conv_store.count())
             )
-            for h in hits:
-                results.append(f"[CONV] {h.payload.get('text', '')}")
-        except Exception as e:
-            print(f"[Memory] Conv query error: {e}")
+            for doc in conv_res["documents"][0]:
+                results.append(f"[CONV] {doc}")
 
-        try:
-            hits = self.client.search(
-                collection_name=CMD_COL,
-                query_vector=vector,
-                limit=cmd_n
+        if cmd_n > 0 and self.cmd_store.count() > 0:
+            cmd_res = self.cmd_store.query(
+                query_texts=[query],
+                n_results=min(cmd_n, self.cmd_store.count())
             )
-            for h in hits:
-                results.append(f"[CMD] {h.payload.get('text', '')}")
-        except Exception as e:
-            print(f"[Memory] Cmd query error: {e}")
+            for doc in cmd_res["documents"][0]:
+                results.append(f"[CMD] {doc}")
+
+        # BUG FIX 3: If both stores are empty, query() is never called, which
+        # is fine — but if one store has fewer documents than requested,
+        # ChromaDB raises an error. The min() guards above handle that, but
+        # we also need to handle the case where count() == 0 cleanly, which
+        # the existing `and self.conv_store.count() > 0` guards already do.
+        # No code change needed here, but left this note for clarity.
 
         return "\n".join(results) if results else "No relevant memory found."
