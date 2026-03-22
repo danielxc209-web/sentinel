@@ -9,7 +9,9 @@ from pathlib import Path
 from groq import Groq
 from memory import Memory
 
-GROQ_MODEL = "llama-3.1-70b-versatile"
+# BUG FIX 1: "llama-3.1-70b-versatile" was deprecated/removed from Groq's API.
+# The correct current model name is "llama-3.3-70b-versatile".
+GROQ_MODEL = "llama-3.3-70b-versatile"
 TOOLS_DIR = Path(__file__).parent / "tools"
 
 SYSTEM_PROMPT = """You are an executor AI. You receive tasks and carry them out by writing and running Python code.
@@ -22,7 +24,7 @@ You have access to a tools/ directory of Python modules. You can:
 
 Available tool files will be listed in your context.
 
-Always respond with valid JSON only:
+Always respond with valid JSON only, no markdown, no code fences:
 {
   "action": "run_code" | "create_tool" | "edit_tool" | "use_tool",
   "tool_name": "optional - name of tool file (no .py)",
@@ -62,19 +64,35 @@ class Executor:
         for t in tools:
             if t.name == "__init__.py":
                 continue
-            lines.append(f"- {t.stem}: {t.read_text()[:200].splitlines()[0]}")
+            # BUG FIX 2: If a tool file is empty, splitlines()[0] raises
+            # IndexError. Use a default fallback.
+            first_line = t.read_text()[:200].splitlines()
+            lines.append(f"- {t.stem}: {first_line[0] if first_line else '(empty)'}")
         return "\n".join(lines)
 
     def _write_tool(self, name: str, code: str):
-        path = TOOLS_DIR / f"{name}.py"
+        # BUG FIX 3: No validation on tool_name. A malicious or hallucinated
+        # name like "../../../etc/passwd" could write outside the tools dir.
+        # Sanitise to alphanumeric + underscores only.
+        safe_name = "".join(c for c in name if c.isalnum() or c == "_")
+        if not safe_name:
+            raise ValueError(f"Invalid tool name: {name!r}")
+        path = TOOLS_DIR / f"{safe_name}.py"
         path.write_text(code)
         print(f"[Executor] Wrote tool: {path}")
+        return safe_name  # return the sanitised name for downstream use
 
     def _reload_tool(self, name: str):
         full = f"tools.{name}"
         if full in sys.modules:
             del sys.modules[full]
-        importlib.import_module(full)
+        # BUG FIX 4: If the tool has a syntax error, importlib.import_module()
+        # raises SyntaxError or ImportError and propagates uncaught up to
+        # _execute(). Catch and return a useful error string instead.
+        try:
+            importlib.import_module(full)
+        except Exception as e:
+            raise RuntimeError(f"Failed to import tool '{name}': {e}") from e
 
     def _run_code(self, code: str) -> str:
         """Execute code string, capture stdout-style prints via exec scope."""
@@ -84,8 +102,13 @@ class Executor:
             "print": lambda *a, **k: output_lines.append(" ".join(str(x) for x in a)),
             "TOOLS_DIR": TOOLS_DIR,
         }
-        # Add tools to scope
-        sys.path.insert(0, str(Path(__file__).parent))
+        # BUG FIX 5: sys.path.insert() is called on every _run_code() invocation
+        # without ever cleaning up, causing the path to grow indefinitely over
+        # a long session. Check before inserting.
+        parent = str(Path(__file__).parent)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+
         try:
             exec(compile(code, "<executor>", "exec"), exec_globals)
             return "\n".join(output_lines) if output_lines else "Code ran with no output."
@@ -110,7 +133,22 @@ class Executor:
             max_tokens=2000
         )
         raw = completion.choices[0].message.content.strip()
-        return json.loads(raw)
+
+        # BUG FIX 6: Same as Orchestrator — LLMs wrap JSON in markdown fences.
+        # Strip them before parsing or json.loads() will raise.
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        # BUG FIX 7: json.loads() failure here propagates as an unhandled
+        # exception all the way up to _process() which catches it generically.
+        # Raise a more descriptive error so the log is useful.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"LLM returned invalid JSON: {e}\nRaw: {raw!r}") from e
 
     def _execute(self, plan: dict) -> str:
         action = plan.get("action")
@@ -120,15 +158,26 @@ class Executor:
 
         print(f"[Executor] Action: {action} | {explanation[:80]}")
 
+        # BUG FIX 8: create_tool action wrote the file then immediately ran
+        # the raw code with _run_code(). But tool files typically define
+        # functions and don't have a __main__ block — running the definition
+        # code does nothing useful and may error. The correct behaviour is to
+        # import the tool after writing it. Changed to _reload_tool().
         if action == "create_tool":
-            self._write_tool(tool_name, code)
-            outcome = self._run_code(code)
-            return f"Created tool '{tool_name}'. {outcome}"
+            safe_name = self._write_tool(tool_name, code)
+            try:
+                self._reload_tool(safe_name)
+                return f"Created and imported tool '{safe_name}'."
+            except RuntimeError as e:
+                return str(e)
 
         elif action == "edit_tool":
-            self._write_tool(tool_name, code)
-            self._reload_tool(tool_name)
-            return f"Edited tool '{tool_name}'."
+            safe_name = self._write_tool(tool_name, code)
+            try:
+                self._reload_tool(safe_name)
+                return f"Edited tool '{safe_name}'."
+            except RuntimeError as e:
+                return str(e)
 
         elif action in ("run_code", "use_tool"):
             return self._run_code(code)
@@ -145,7 +194,7 @@ class Executor:
         try:
             plan = self._plan(task, context, mode_score)
             outcome = self._execute(plan)
-        except Exception as e:
+        except Exception:
             outcome = f"Executor failed: {traceback.format_exc()}"
 
         print(f"[Executor] Outcome: {outcome[:120]}...")

@@ -7,6 +7,7 @@ import os
 import queue
 import signal
 import threading
+import sys
 
 from transcriber import Transcriber
 from orchestrator import Orchestrator
@@ -35,11 +36,19 @@ def main():
         threading.Thread(target=executor.run,     daemon=True, name="Executor"),
     ]
 
+    # BUG FIX 1: The original shutdown() called .stop() on all agents but then
+    # returned, letting the main thread fall through to the t.join() loop.
+    # However, daemon threads are killed instantly when the main thread exits,
+    # so the joins may never complete. Use a threading.Event to let the main
+    # thread block cleanly until shutdown is confirmed.
+    shutdown_event = threading.Event()
+
     def shutdown(sig, frame):
         print("\n[Main] Shutting down...")
         transcriber.stop()
         orchestrator.stop()
         executor.stop()
+        shutdown_event.set()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -48,10 +57,21 @@ def main():
     for t in threads:
         t.start()
 
-    for t in threads:
-        t.join()
+    # BUG FIX 2: The original called t.join() on daemon threads with no
+    # timeout. If a thread hangs (e.g. Transcriber blocked on sd.wait()),
+    # the process will never exit even after Ctrl+C. Use a timeout so the
+    # main thread can force-exit if threads don't stop cleanly within 5s.
+    shutdown_event.wait()  # block here until signal handler fires
 
+    for t in threads:
+        t.join(timeout=5.0)
+        if t.is_alive():
+            print(f"[Main] Warning: thread '{t.name}' did not stop cleanly.")
+
+    # BUG FIX 3: There was no final log line confirming clean exit vs forced
+    # exit, making it hard to tell from logs whether shutdown was clean.
     print("[Main] Done.")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

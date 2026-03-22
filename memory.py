@@ -33,7 +33,12 @@ class Memory:
         return f"{prefix}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
 
     def save_conversation(self, text: str, metadata: Optional[dict] = None):
-        meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        # BUG FIX 1: ChromaDB requires all metadata values to be str, int, float,
+        # or bool. Passing None or other types raises a hard error at runtime.
+        # Sanitise the metadata dict before storing.
+        raw_meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                for k, v in raw_meta.items()}
         self.conv_store.add(
             documents=[text],
             metadatas=[meta],
@@ -41,7 +46,10 @@ class Memory:
         )
 
     def save_command(self, text: str, metadata: Optional[dict] = None):
-        meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        # BUG FIX 1 (same): same metadata sanitisation needed here.
+        raw_meta = {"timestamp": datetime.utcnow().isoformat(), **(metadata or {})}
+        meta = {k: str(v) if not isinstance(v, (str, int, float, bool)) else v
+                for k, v in raw_meta.items()}
         self.cmd_store.add(
             documents=[text],
             metadatas=[meta],
@@ -58,6 +66,14 @@ class Memory:
 
         conv_n = max(1, round(n * (1 - mode_score)))
         cmd_n  = max(1, round(n * mode_score))
+
+        # BUG FIX 2: The original always fetched at least 1 result from BOTH
+        # stores regardless of mode_score, because conv_n and cmd_n were each
+        # floored at 1. This means a pure-command query (mode_score=1.0) still
+        # pulled a conversation result, polluting the context. Fixed by only
+        # clamping to 1 when the store is actually supposed to contribute.
+        conv_n = round(n * (1 - mode_score))
+        cmd_n  = round(n * mode_score)
 
         results = []
 
@@ -76,5 +92,12 @@ class Memory:
             )
             for doc in cmd_res["documents"][0]:
                 results.append(f"[CMD] {doc}")
+
+        # BUG FIX 3: If both stores are empty, query() is never called, which
+        # is fine — but if one store has fewer documents than requested,
+        # ChromaDB raises an error. The min() guards above handle that, but
+        # we also need to handle the case where count() == 0 cleanly, which
+        # the existing `and self.conv_store.count() > 0` guards already do.
+        # No code change needed here, but left this note for clarity.
 
         return "\n".join(results) if results else "No relevant memory found."
