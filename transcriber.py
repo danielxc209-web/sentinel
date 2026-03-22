@@ -13,6 +13,13 @@ class Transcriber:
         self.input_queue = input_queue
         self.model = whisper.load_model(model_size)
         self._stop = threading.Event()
+        self._muted = threading.Event()  # set = muted
+
+    def mute(self):
+        self._muted.set()
+
+    def unmute(self):
+        self._muted.clear()
 
     def _is_silent(self, audio: np.ndarray) -> bool:
         return np.abs(audio).mean() < SILENCE_THRESHOLD
@@ -26,6 +33,9 @@ class Transcriber:
     def run(self):
         print("[Transcriber] Listening...")
         while not self._stop.is_set():
+            if self._muted.is_set():
+                self._stop.wait(timeout=0.5)
+                continue
             audio = self._record_chunk()
             if self._is_silent(audio):
                 continue

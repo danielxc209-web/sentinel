@@ -1,6 +1,6 @@
 groq
 openai-whisper
-chromadb
+qdrant-client[fastembed]
 pyaudio
 numpy
 sounddevice
@@ -8,3 +8,4 @@ scipy
 pillow
 pyautogui
 requests
+pyttsx3
